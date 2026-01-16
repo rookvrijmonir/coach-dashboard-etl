@@ -1,0 +1,13 @@
+# HubSpot API Client
+hubspot-api-client>=8.0.0
+
+# Google Cloud BigQuery
+google-cloud-bigquery>=3.10.0
+db-dtypes>=1.0.0
+
+# Data Verwerking
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Security & Config
+python-dotenv>=1.0.0
