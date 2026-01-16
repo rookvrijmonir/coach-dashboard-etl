@@ -1,0 +1,18 @@
+# Negeer de virtual environment map
+venv/
+__pycache__/
+*.pyc
+
+# Negeer geheime bestanden (.env bevat straks je keys)
+.env
+secrets.json
+
+# Negeer lokale data bestanden (behalve voorbeelden)
+data/*
+!data/.gitkeep
+*.csv
+*.xlsx
+
+# Mac/Windows systeem bestanden
+.DS_Store
+Thumbs.db
