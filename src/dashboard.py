@@ -1,195 +1,177 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import os
+from datetime import datetime, timedelta
 
 # --- PAGINA CONFIGURATIE ---
-st.set_page_config(
-    page_title="Coach Load Balancer",
-    page_icon="📊",
-    layout="wide"
-)
+st.set_page_config(page_title="Coach Benchmark & Status", layout="wide")
 
-# --- FUNCTIES ---
+# Definitie van Actieve Fases
+ACTIVE_STAGES = {
+    "114855767": "Warme aanvraag",
+    "15415582": "Informatie aangevraagd",
+    "15415583": "Gebeld, geen gehoor",
+    "15415584": "Bereikt, later terugbellen",
+    "114803327": "Bereikt, belafspraak ingepland",
+    "15413222": "Intake gepland",
+    "15413223": "In begeleiding",
+    "15413630": "Tijdelijk stoppen (50%)",
+    "15413631": "Start later"
+}
+
+# Definitie van Terminale Fases
+TERMINAL_STAGES = {
+    "15413226": "Afgesloten / Gewonnen",
+    "15413632": "Geen interesse / Verloren",
+    "25956255": "Nooit bereikt"
+}
+
 def load_data():
-    """Laadt de data uit de lokale CSV export."""
-    # We gaan er vanuit dat main.py dit bestand heeft aangemaakt in de 'data' map
-    file_path = os.path.join('data', 'hubspot_export_raw.csv')
+    if not os.path.exists('data/hubspot_export_raw.csv'):
+        st.error("CSV niet gevonden. Draai main.py."); return None
     
-    if not os.path.exists(file_path):
-        st.error(f"❌ Geen data gevonden op pad: {file_path}")
-        st.info("💡 Tip: Draai eerst 'python src/main.py' om de data uit HubSpot te halen.")
-        return None
-        
-    try:
-        # Lees CSV (let op: puntkomma als scheidingsteken, want dat doet main.py ook)
-        df = pd.read_csv(file_path, sep=';')
-        
-        # Datums omzetten naar datetime objecten voor rekenwerk
-        date_cols = [
-            'createdate', 
-            'laatste_activiteit', 
-            'datum_in_fase', 
-            'datum_naar_nabeller', 
-            'datum_in_gebeld_geen_gehoor'
-        ]
-        
-        for col in date_cols:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors='coerce')
-                
-        return df
-    except Exception as e:
-        st.error(f"Fout bij inlezen data: {e}")
-        return None
-
-def calculate_kpis(df):
-    """Berekent de belangrijkste metrics voor bovenin het dashboard."""
-    totaal_deals = len(df)
+    df = pd.read_csv('data/hubspot_export_raw.csv', sep=';')
+    # Zorg dat coach_naam altijd tekst is en vul missende waarden in
+    df['coach_naam'] = df['coach_naam'].astype(str).replace('nan', 'Onbekend')
     
-    # 1. Verdrink Ratio (Leads naar nabeller)
-    # We kijken of er een datum is ingevuld bij 'datum_naar_nabeller'
-    if 'datum_naar_nabeller' in df.columns:
-        verdronken = df[df['datum_naar_nabeller'].notna()]
-        aantal_verdronken = len(verdronken)
-    else:
-        aantal_verdronken = 0
-        
-    verdrink_ratio = (aantal_verdronken / totaal_deals * 100) if totaal_deals > 0 else 0
+    # Datums converteren
+    date_cols = ['createdate', 'ts_warme_aanvraag', 'ts_in_begeleiding', 'datum_afgesloten']
+    for col in date_cols:
+        df[col] = pd.to_datetime(df[col], errors='coerce', utc=True).dt.tz_localize(None)
     
-    # 2. Stagnatie (Voorbeeld: langer dan 14 dagen in huidige fase)
-    aantal_stagnatie = 0
-    if 'datum_in_fase' in df.columns:
-        nu = pd.Timestamp.now(tz='UTC')
-        # Zorg voor timezone awareness als de dataframe dat niet heeft
-        if df['datum_in_fase'].dt.tz is None:
-             df['datum_in_fase'] = df['datum_in_fase'].dt.tz_localize('UTC')
-        
-        # Tel aantal deals dat langer dan 14 dagen in de fase zit
-        dagen_in_fase = (nu - df['datum_in_fase']).dt.days
-        aantal_stagnatie = dagen_in_fase[dagen_in_fase > 14].count()
-
-    return totaal_deals, aantal_verdronken, verdrink_ratio, aantal_stagnatie
-
-# --- DASHBOARD START ---
-st.title("📊 Coach Load & Performance Dashboard")
-st.markdown("Lokaal prototype op basis van HubSpot export.")
+    # Status en Actief vlag bepalen
+    df['stage_id_str'] = df['dealstage'].astype(str)
+    df['Fase'] = df['stage_id_str'].map({**ACTIVE_STAGES, **TERMINAL_STAGES}).fillna("Overig")
+    df['Is_Actief'] = df['stage_id_str'].isin(ACTIVE_STAGES.keys())
+    
+    # Dagen in fase berekenen (Stagnatie)
+    nu = pd.Timestamp.now()
+    df['dagen_in_fase'] = (nu - df['ts_warme_aanvraag'].fillna(df['createdate'])).dt.days
+    
+    return df
 
 df = load_data()
 
 if df is not None:
-    # --- FILTERS (Sidebar) ---
-    st.sidebar.header("Filters")
+    st.title("🏆 Coach Benchmark Dashboard")
     
-    # Filter 1: Deal Fase
-    if 'dealstage' in df.columns:
-        fases = ["Alle"] + sorted(list(df['dealstage'].dropna().unique()))
-        gekozen_fase = st.sidebar.selectbox("Kies Fase:", fases)
-        
-        if gekozen_fase != "Alle":
-            df_filtered = df[df['dealstage'] == gekozen_fase]
-        else:
-            df_filtered = df
-    else:
-        df_filtered = df
+    # --- SIDEBAR ---
+    st.sidebar.header("Instellingen")
+    
+    # 1. Tijd (Cruciale schuifregelaar behouden)
+    dagen_terug = st.sidebar.slider("Instroom periode (dagen terug):", 7, 365, 90)
+    grens_datum = pd.Timestamp.now() - timedelta(days=dagen_terug)
+    
+    # 2. Coach Selectie
+    all_coaches = sorted(df['coach_naam'].unique().tolist())
+    sel_coaches = st.sidebar.multiselect("Selecteer Coaches voor Vergelijking:", all_coaches, default=all_coaches[:2] if len(all_coaches)>1 else all_coaches)
+    
+    # 3. Status Filter
+    status_filter = st.sidebar.radio("Focus op:", 
+                                    ["Alleen Actieve Werkvoorraad", "Alles (inclusief Afgesloten)"])
 
-    # --- KPI BLOKKEN ---
-    totaal, verdronken, ratio, stagnatie = calculate_kpis(df_filtered)
+    # --- FILTERING ---
+    # We pakken eerst de hele dataset voor de geselecteerde periode voor de Benchmark berekening
+    df_period_all = df[df['createdate'] >= grens_datum]
     
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Aantal Deals", totaal)
-    col2.metric("Naar Nabeller (Verdronken)", verdronken, delta_color="inverse")
-    col3.metric("Verdrink Ratio", f"{ratio:.1f}%", delta_color="inverse")
-    col4.metric("Stagnatie (>14 dgn)", stagnatie, delta_color="inverse")
+    if status_filter == "Alleen Actieve Werkvoorraad":
+        df_display_all = df_period_all[df_period_all['Is_Actief'] == True]
+    else:
+        df_display_all = df_period_all
+
+    # Filter nu voor de geselecteerde coaches
+    df_selection = df_display_all[df_display_all['coach_naam'].isin(sel_coaches)]
+
+    # --- BENCHMARK BEREKENING ---
+    # Gemiddelde werkdruk per fase (Totaal aantal deals in fase / aantal unieke coaches)
+    num_coaches = df_period_all['coach_naam'].nunique()
+    if num_coaches == 0: num_coaches = 1
     
+    bench_counts = df_display_all.groupby('Fase').size() / num_coaches
+    bench_counts = bench_counts.reset_index(name='Waarde')
+    bench_counts['Type'] = 'Werkdruk (Aantal)'
+    bench_counts['coach_naam'] = 'Gemiddelde (Benchmark)'
+
+    # Gemiddelde stilstand per fase (Mean van alle deals in die fase)
+    bench_days = df_display_all.groupby('Fase')['dagen_in_fase'].mean().reset_index(name='Waarde')
+    bench_days['Type'] = 'Stilstand (Dagen)'
+    bench_days['coach_naam'] = 'Gemiddelde (Benchmark)'
+
+    # --- METRICS ---
+    st.subheader(f"Status & Vergelijking (Sinds {grens_datum.date()})")
+    m1, m2, m3, m4 = st.columns(4)
+    
+    with m1:
+        st.metric("Geselecteerde Dossiers", len(df_selection))
+    with m2:
+        global_avg = df_display_all['dagen_in_fase'].mean()
+        local_avg = df_selection['dagen_in_fase'].mean() if not df_selection.empty else 0
+        st.metric("Gem. Dagen Stilstand", f"{local_avg:.1f} dgn", 
+                  delta=f"{local_avg - global_avg:.1f} vs Gem." if local_avg > 0 else None, 
+                  delta_color="inverse")
+    with m3:
+        actieve_procent = (len(df_selection[df_selection['Is_Actief']]) / len(df_selection) * 100) if not df_selection.empty else 0
+        st.metric("Percentage Actief", f"{actieve_procent:.0f}%")
+    with m4:
+        st.metric("Aantal Coaches in Systeem", num_coaches)
+
     st.divider()
 
-    # --- TABBLADEN VOOR DIEPGANG ---
-    tab1, tab2, tab3 = st.tabs(["📈 Verdrink Analyse", "🚨 Stagnatie", "🗺️ Regio & Postcode"])
+    # --- VISUALS ---
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.subheader("Werkvoorraad vs. Benchmark")
+        # Combineer geselecteerde data met benchmark data voor de grafiek
+        plot_counts = df_selection.groupby(['coach_naam', 'Fase']).size().reset_index(name='Waarde')
+        # Voeg benchmark toe
+        plot_counts = pd.concat([plot_counts, bench_counts.rename(columns={'Waarde': 'Waarde'})])
+        
+        fig_hist = px.bar(
+            plot_counts, 
+            x="Fase", 
+            y="Waarde", 
+            color="coach_naam", 
+            barmode="group",
+            title="Aantal dossiers per fase (Gemiddelde vs Geselecteerd)",
+            category_orders={"Fase": list(ACTIVE_STAGES.values()) + list(TERMINAL_STAGES.values())}
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    with c2:
+        st.subheader("Stilstand vs. Benchmark")
+        # Combineer geselecteerde data met benchmark data
+        plot_days = df_selection.groupby(['coach_naam', 'Fase'])['dagen_in_fase'].mean().reset_index(name='Waarde')
+        plot_days = pd.concat([plot_days, bench_days])
+        
+        fig_speed = px.bar(
+            plot_days, 
+            x="Fase", 
+            y="Waarde", 
+            color="coach_naam", 
+            barmode="group",
+            title="Gemiddelde dagen stilstand (Gemiddelde vs Geselecteerd)"
+        )
+        fig_speed.add_hline(y=14, line_dash="dash", line_color="red", annotation_text="Stagnatiegrens")
+        st.plotly_chart(fig_speed, use_container_width=True)
+
+    # --- PRIVACY-VEILIGE TABEL ---
+    st.subheader("Dossier Details (Zonder Namen)")
+    # We tonen hier de records per geselecteerde coach
+    # Door record-id te gebruiken ipv naam is de tabel AVG-veilig
+    cols_to_show = ['deal_id', 'coach_naam', 'Fase', 'dagen_in_fase', 'createdate']
     
-    # TAB 1: VERDRINK RATIO (Wie verliest leads?)
-    with tab1:
-        st.subheader("Verdrink Analyse: Wie verliest leads?")
-        st.markdown("*Dit toont welke 'Broncoach' de lead had voordat hij naar de nabeller ging.*")
-        
-        if 'broncoach' in df_filtered.columns:
-             # We tellen alleen de records waar 'broncoach' is ingevuld (want dat zijn de 'verliezers')
-             verlies_per_coach = df_filtered[df_filtered['broncoach'].notna()]['broncoach'].value_counts().reset_index()
-             
-             if not verlies_per_coach.empty:
-                 verlies_per_coach.columns = ['Coach', 'Aantal Verloren']
-                 fig = px.bar(verlies_per_coach, x='Coach', y='Aantal Verloren', 
-                              title="Leads doorgezet naar Nabeller per Coach",
-                              color='Aantal Verloren', color_continuous_scale='Reds')
-                 st.plotly_chart(fig, use_container_width=True)
-             else:
-                 st.success("Geen 'broncoach' data gevonden in de huidige selectie. Goed teken! (Of de kolom is leeg)")
-        else:
-             st.warning("Kolom 'broncoach' ontbreekt in dataset.")
+    st.dataframe(
+        df_selection[cols_to_show].sort_values(['coach_naam', 'dagen_in_fase'], ascending=[True, False]),
+        use_container_width=True,
+        hide_index=True
+    )
 
-    # TAB 2: STAGNATIE (Wie is traag?)
-    with tab2:
-        st.subheader("Stagnatie Analyse")
-        
-        if 'datum_in_fase' in df_filtered.columns:
-            nu = pd.Timestamp.now(tz='UTC')
-            # Timezone fix (veiligheidshalve nogmaals)
-            if df_filtered['datum_in_fase'].dt.tz is None:
-                 df_filtered['datum_in_fase'] = df_filtered['datum_in_fase'].dt.tz_localize('UTC')
-            
-            # Bereken dagen
-            df_filtered['dagen_in_fase'] = (nu - df_filtered['datum_in_fase']).dt.days
-            
-            # Histogram
-            fig_hist = px.histogram(df_filtered, x="dagen_in_fase", nbins=20, 
-                                    title="Verdeling: Hoe lang staan deals stil?",
-                                    labels={'dagen_in_fase': 'Dagen in huidige fase'})
-            st.plotly_chart(fig_hist, use_container_width=True)
-            
-            # Top 10 Tabel
-            st.write("⚠️ Top 10 Langstlopende Deals in huidige selectie:")
-            
-            show_cols = ['deal_name', 'dealstage', 'dagen_in_fase']
-            # Voeg extra kolommen toe als ze bestaan voor context
-            if 'laatste_activiteit' in df_filtered.columns: show_cols.append('laatste_activiteit')
-            if 'broncoach' in df_filtered.columns: show_cols.append('broncoach')
-
-            st.dataframe(
-                df_filtered[show_cols]
-                .sort_values('dagen_in_fase', ascending=False)
-                .head(10)
-            )
-        else:
-            st.warning("Geen datum velden voor stagnatie gevonden.")
-
-    # TAB 3: REGIO (Waar zitten ze?)
-    with tab3:
-        st.subheader("Geografische Spreiding")
-        
-        if 'postcode' in df_filtered.columns:
-            # Maak een kopie om warnings te voorkomen
-            df_geo = df_filtered.copy()
-            
-            # Schoonmaken: Haal lege postcodes weg en maak string
-            df_geo = df_geo.dropna(subset=['postcode'])
-            df_geo['postcode'] = df_geo['postcode'].astype(str)
-            
-            # Eerste 2 cijfers pakken (PC2 regio)
-            df_geo['regio'] = df_geo['postcode'].str[:2]
-            
-            # Tellen
-            regio_counts = df_geo['regio'].value_counts().reset_index()
-            regio_counts.columns = ['Regio (PC2)', 'Aantal']
-            
-            # Sorteren op aantal
-            regio_counts = regio_counts.sort_values('Aantal', ascending=False)
-            
-            fig_map = px.bar(regio_counts, x='Regio (PC2)', y='Aantal', 
-                             title="Deals per Regio (Eerste 2 cijfers postcode)")
-            st.plotly_chart(fig_map, use_container_width=True)
-        else:
-            st.warning("Geen postcodes gevonden.")
-
-    # RUWE DATA (Altijd handig voor debuggen)
-    with st.expander("🔍 Toon Ruwe Data Tabel"):
-        st.dataframe(df_filtered)
+    st.info("""
+    **Uitleg Benchmark:**
+    * De groep **Gemiddelde (Benchmark)** berekent voor elke fase hoeveel dossiers een coach *gemiddeld* heeft over het hele systeem.
+    * Als een coach veel hoger scoort dan de benchmark in een actieve fase, kan dit duiden op een te hoge werkdruk.
+    * In de stilstand grafiek zie je of de coach sneller of langzamer werkt dan het organisatie-gemiddelde.
+    """)

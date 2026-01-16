@@ -1,205 +1,114 @@
 import os
 import sys
-import re
 import pandas as pd
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from hubspot import HubSpot
 from hubspot.crm.deals import PublicObjectSearchRequest, ApiException
-from hubspot.crm.associations import BatchInputPublicObjectId, ApiException as AssociationException
-from hubspot.crm.contacts import BatchReadInputSimplePublicObjectId, ApiException as ContactException
+from hubspot.crm.associations import BatchInputPublicObjectId
+from hubspot.crm.contacts import BatchReadInputSimplePublicObjectId
 
 # --- CONFIGURATIE ---
-# We zoeken het .env bestand in de hoofdmap
 dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
 load_dotenv(dotenv_path)
 
-# 1. DEAL EIGENSCHAPPEN (Wat we ophalen)
 DEAL_PROPS = [
-    # Basis
-    "dealname", "amount", "dealstage", "pipeline", "hubspot_owner_id", 
-    "createdate", "closedate",
-    
-    # Tijd & Activiteit (Standaard HubSpot velden die altijd bestaan)
-    "hs_last_sales_activity_date",  # Wanneer was laatste actie coach?
-    "hs_date_entered_dealstage",    # Wanneer in de HUIDIGE fase gekomen?
-    
-    # Custom (Uit jouw bestanden/input)
-    "broncoach_tekst", 
-    "hoeveelheid_begeleiding", 
-    "mag_gedeclareerd_worden",
-    "datum_naar_nabeller",
-
-    # Specifieke stagnatie (gevonden met jouw zoektocht)
-    "hs_v2_date_entered_15415583" # Datum in "Gebeld, geen gehoor"
+    "dealname", "dealstage", "pipeline", "createdate", "hubspot_owner_id",
+    "verzekeraar", "broncoach_tekst", "hoeveelheid_begeleiding",
+    "datum_afgesloten", "hs_v2_date_entered_15413226", 
+    "ts_warme_aanvraag", "ts_info_aangevraagd", "ts_in_begeleiding",
+    # We halen ook de interne tijdstempels op die we in de CSV zagen
+    "hs_v2_date_entered_114855767", # Warme aanvraag
+    "hs_v2_date_entered_15413223"   # In begeleiding
 ]
-
-# 2. CONTACT Eigenschappen
-CONTACT_PROPS = [
-    "firstname", "lastname", "email", "zip", "city", 
-    "verzekeraar" 
-]
-
-def clean_bsn(text):
-    """Privacy: Verwijder BSN patronen (8-9 cijfers) uit tekst."""
-    if not isinstance(text, str): return text
-    return re.sub(r'\b\d{8,9}\b', '[BSN_VERWIJDERD]', text)
 
 def get_client():
     token = os.getenv("HUBSPOT_ACCESS_TOKEN")
-    if not token or "plak_hier" in token:
-        print("FOUT: Check je .env bestand! Token ontbreekt.")
-        sys.exit(1)
+    if not token: print("FOUT: Geen token!"); sys.exit(1)
     return HubSpot(access_token=token)
 
-def get_associations_batch(client, deal_ids):
-    """Haalt Contact ID's op die bij een lijst Deals horen."""
-    deal_to_contact = {}
-    if not deal_ids: return deal_to_contact
-
+def get_owner_map(client):
+    """Haalt alle HubSpot Owners op om ID's naar Namen te vertalen."""
+    print("👤 Owners ophalen uit HubSpot...")
+    owner_map = {}
     try:
-        batch_input = BatchInputPublicObjectId(inputs=deal_ids)
-        response = client.crm.associations.batch_api.read(
-            from_object_type="deal",
-            to_object_type="contact",
-            batch_input_public_object_id=batch_input
-        )
-        for result in response.results:
-            if result.to and len(result.to) > 0:
-                deal_to_contact[result._from.id] = result.to[0].id
-    except AssociationException as e:
-        print(f"⚠️ Kon associaties niet ophalen: {e}")
-
-    return deal_to_contact
-
-def get_contacts_details_batch(client, contact_ids):
-    """Haalt Contact Details (Postcode, Verzekeraar) op."""
-    contact_data = {}
-    unique_ids = list(set(contact_ids))
-    if not unique_ids: return contact_data
-
-    chunk_size = 100
-    for i in range(0, len(unique_ids), chunk_size):
-        chunk = unique_ids[i:i + chunk_size]
-        try:
-            batch_input = BatchReadInputSimplePublicObjectId(
-                inputs=[{"id": uid} for uid in chunk],
-                properties=CONTACT_PROPS
-            )
-            response = client.crm.contacts.batch_api.read(
-                batch_read_input_simple_public_object_id=batch_input
-            )
-            for contact in response.results:
-                contact_data[contact.id] = contact.properties
-        except ContactException as e:
-            print(f"⚠️ Fout bij ophalen contact details: {e}")
-    return contact_data
+        owners = client.crm.owners.get_all()
+        for owner in owners:
+            owner_map[str(owner.id)] = f"{owner.first_name} {owner.last_name}".strip()
+    except Exception as e:
+        print(f"⚠️ Kon owners niet ophalen: {e}")
+    return owner_map
 
 def run_pipeline():
     client = get_client()
-    start_timestamp = os.getenv("START_DATE_TIMESTAMP")
+    owner_map = get_owner_map(client)
     
-    print(f"--- START DATA EXTRACTIE (Opslaan naar CSV) ---")
+    print("\n" + "="*50)
+    user_input = input("🔢 Hoeveel deals ophalen? (Leeg = ALLES): ").strip()
+    max_limit = int(user_input) if user_input.isdigit() else None
+    print("="*50 + "\n")
+
+    # Start vanaf maart 2025 (zoals in je eerdere vraag)
+    current_start = datetime(2025, 3, 1)
+    end_goal = datetime.now()
     
     all_rows = []
-    after = 0
-    batch_size = 50 
-    total_processed = 0
-
-    while True:
-        # A. Deals Ophalen
-        search_request = PublicObjectSearchRequest(
-            filter_groups=[{
-                "filters": [{
-                    "propertyName": "createdate",
-                    "operator": "GTE",
-                    "value": start_timestamp
-                }]
-            }],
-            properties=DEAL_PROPS,
-            limit=batch_size,
-            after=after,
-            sorts=["createdate"]
-        )
+    total_count = 0
+    
+    while current_start < end_goal:
+        if max_limit and total_count >= max_limit: break
+        current_end = current_start + timedelta(days=14)
+        print(f"📅 Periode: {current_start.date()} tot {current_end.date()}...")
         
-        try:
-            deal_response = client.crm.deals.search_api.do_search(public_object_search_request=search_request)
-            deals = deal_response.results
+        after = 0
+        while True:
+            if max_limit and total_count >= max_limit: break
             
-            if not deals:
-                break
+            search_request = PublicObjectSearchRequest(
+                filter_groups=[{
+                    "filters": [
+                        {"propertyName": "createdate", "operator": "GTE", "value": int(current_start.timestamp() * 1000)},
+                        {"propertyName": "createdate", "operator": "LT", "value": int(current_end.timestamp() * 1000)}
+                    ]
+                }],
+                properties=DEAL_PROPS, limit=100, after=after
+            )
+            
+            try:
+                resp = client.crm.deals.search_api.do_search(public_object_search_request=search_request)
+                if not resp.results: break
                 
-            print(f"📦 Batch verwerken: {len(deals)} deals...")
-            
-            # B. Contacten Koppelen
-            deal_ids = [d.id for d in deals]
-            deal_to_contact_map = get_associations_batch(client, deal_ids)
-            
-            contact_ids_to_fetch = list(deal_to_contact_map.values())
-            contact_details_map = get_contacts_details_batch(client, contact_ids_to_fetch)
-
-            # C. Data Samenvoegen
-            for deal in deals:
-                d_props = deal.properties
-                contact_id = deal_to_contact_map.get(deal.id)
-                c_props = contact_details_map.get(contact_id, {}) if contact_id else {}
+                for d in resp.results:
+                    p = d.properties
+                    owner_id = str(p.get("hubspot_owner_id", ""))
+                    
+                    all_rows.append({
+                        "deal_id": d.id,
+                        "dealname": p.get("dealname"),
+                        "createdate": p.get("createdate"),
+                        "dealstage": p.get("dealstage"),
+                        "verzekeraar": p.get("verzekeraar"),
+                        "begeleiding": p.get("hoeveelheid_begeleiding"),
+                        # Gebruik de Owner Name als Coach, fallback op broncoach_tekst
+                        "coach_naam": owner_map.get(owner_id, p.get("broncoach_tekst", "Onbekend")),
+                        "ts_warme_aanvraag": p.get("hs_v2_date_entered_114855767") or p.get("createdate"),
+                        "ts_in_begeleiding": p.get("hs_v2_date_entered_15413223"),
+                        "datum_afgesloten": p.get("hs_v2_date_entered_15413226")
+                    })
                 
-                verzekeraar_clean = clean_bsn(c_props.get("verzekeraar"))
+                total_count += len(resp.results)
+                if not resp.paging or not resp.paging.next: break
+                after = resp.paging.next.after
+            except Exception as e:
+                print(f"❌ Fout: {e}"); break
+        
+        current_start = current_end
 
-                row = {
-                    "deal_id": deal.id,
-                    "deal_name": d_props.get("dealname"),
-                    "createdate": d_props.get("createdate"),
-                    "dealstage": d_props.get("dealstage"),
-                    
-                    # Tijd & Activiteit (Voor stagnatie dashboard)
-                    "laatste_activiteit": d_props.get("hs_last_sales_activity_date"),
-                    "datum_in_fase": d_props.get("hs_date_entered_dealstage"),
-                    "datum_in_gebeld_geen_gehoor": d_props.get("hs_v2_date_entered_15415583"),
-                    
-                    # Business Logic (Jouw velden)
-                    "broncoach": d_props.get("broncoach_tekst"), 
-                    "begeleiding": d_props.get("hoeveelheid_begeleiding"),
-                    "declarabel": d_props.get("mag_gedeclareerd_worden"),
-                    "datum_naar_nabeller": d_props.get("datum_naar_nabeller"),
-                    
-                    # Locatie & Verzekering
-                    "postcode": c_props.get("zip"),
-                    "stad": c_props.get("city"),
-                    "verzekeraar": verzekeraar_clean
-                }
-                all_rows.append(row)
-            
-            total_processed += len(deals)
-
-            if not deal_response.paging or not deal_response.paging.next:
-                break
-            after = deal_response.paging.next.after
-            
-            # VEILIGHEID: Zet deze limiet HOGER of UIT als je alles wilt hebben
-            if total_processed >= 500: 
-                print("🛑 TEST STOP: Limiet van 500 bereikt. Verhoog dit in de code voor meer.")
-                break
-
-        except ApiException as e:
-            print(f"❌ CRASH: {e}")
-            break
-
-    # D. Opslaan naar Bestand
     if all_rows:
         df = pd.DataFrame(all_rows)
-        
-        # Zorg dat de map 'data' bestaat
         os.makedirs('data', exist_ok=True)
-        
-        output_file = 'data/hubspot_export_raw.csv'
-        df.to_csv(output_file, index=False, sep=';')
-        
-        print(f"\n✅ SUCCES! Data opgeslagen in: {output_file}")
-        print(f"   Totaal aantal rijen: {len(df)}")
-        print(f"   Pad: {os.path.abspath(output_file)}")
-        print("\nJe kunt dit bestand nu openen in Excel om te controleren.")
-    else:
-        print("Geen data gevonden.")
+        df.to_csv('data/hubspot_export_raw.csv', index=False, sep=';')
+        print(f"✅ Export klaar: {len(df)} deals met coach-namen.")
 
 if __name__ == "__main__":
     run_pipeline()
