@@ -47,6 +47,9 @@ BASE_URL = "https://api.hubapi.com"
 # Nabeller terminal overrides die als "verloren" tellen (ongeacht probability)
 NABELLER_TERMINAL_LOSS_STAGE_IDS = {"81675521", "81675523", "96512011"}
 
+# Nabeller instroom stages (voor days_to_declarable baseline als deal in Nabeller zit)
+NABELLER_INFLOW_STAGE_IDS = {"116831596", "81686449"}
+
 # Contacteigenschappen (van het deelnemer-record)
 CONTACT_PROPS = ["aangebracht_door", "zip", "geslacht", "geboortejaar"]
 
@@ -418,14 +421,31 @@ def run_pipeline():
             now_utc=now_utc,
         )
 
-        # days_to_declarable: createdate -> mag_decl (date)
+        # days_to_declarable baseline:
+        # - In begeleiding/Status begeleiding: vanaf createdate
+        # - Nabeller: vanaf date_entered van Nabeller instroom (warme aanvraag of informatie aangevraagd)
         days_to_declarable = ""
-        if datum_declarabel and d.get("createdate"):
+        if datum_declarabel:
             try:
-                created_dt = datetime.fromtimestamp(int(d.get("createdate")) / 1000, tz=timezone.utc)
                 decl_dt = datetime.fromisoformat(datum_declarabel + "T00:00:00+00:00")
-                delta_days = (decl_dt - created_dt).total_seconds() / 86400.0
-                days_to_declarable = round(delta_days, 1)
+
+                baseline_dt = None
+                if is_nabeller:
+                    inflow_dts = []
+                    for sid in NABELLER_INFLOW_STAGE_IDS:
+                        v = d.get(f"hs_v2_date_entered_{sid}")
+                        dtv = parse_to_utc_datetime(v)
+                        if dtv:
+                            inflow_dts.append(dtv)
+                    if inflow_dts:
+                        baseline_dt = min(inflow_dts)
+
+                if not baseline_dt:
+                    baseline_dt = parse_to_utc_datetime(d.get("createdate"))
+
+                if baseline_dt:
+                    delta_days = (decl_dt - baseline_dt).total_seconds() / 86400.0
+                    days_to_declarable = round(delta_days, 1)
             except Exception:
                 days_to_declarable = ""
 
