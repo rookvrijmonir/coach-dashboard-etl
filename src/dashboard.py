@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 # --- PAGINA CONFIGURATIE ---
 st.set_page_config(page_title="Coach Benchmark & Status", layout="wide")
 
-# Definitie van Actieve Fases (In volgorde van de pijplijn)
+# Definitie van Actieve FASES (In volgorde van de pijplijn)
 ACTIVE_STAGES = {
     "114855767": "Warme aanvraag",
     "15415582": "Informatie aangevraagd",
@@ -21,15 +21,20 @@ ACTIVE_STAGES = {
     "15413631": "Start later"
 }
 
-# Definitie van Terminale Fases
+# Definitie van Terminale Fases (Nooit bereikt samengevoegd met Verloren)
 TERMINAL_STAGES = {
     "15413226": "Afgesloten / Gewonnen",
     "15413632": "Geen interesse / Verloren",
-    "25956255": "Nooit bereikt"
+    "25956255": "Geen interesse / Verloren"
 }
 
-# Volgorde voor weergave in tabelkolommen (Chronologisch)
-PIPELINE_ORDER = list(ACTIVE_STAGES.values()) + list(TERMINAL_STAGES.values())
+# Unieke lijst van fase namen voor de kolomvolgorde
+PIPELINE_ORDER = [
+    "Warme aanvraag", "Informatie aangevraagd", "Gebeld, geen gehoor", 
+    "Bereikt, later terugbellen", "Bereikt, belafspraak ingepland", 
+    "Intake gepland", "In begeleiding", "Tijdelijk stoppen (50%)", 
+    "Start later", "Afgesloten / Gewonnen", "Geen interesse / Verloren"
+]
 
 def load_data():
     if not os.path.exists('data/hubspot_export_raw.csv'):
@@ -43,8 +48,17 @@ def load_data():
         df[col] = pd.to_datetime(df[col], errors='coerce', utc=True).dt.tz_localize(None)
     
     df['stage_id_str'] = df['dealstage'].astype(str)
-    df['Fase'] = df['stage_id_str'].map({**ACTIVE_STAGES, **TERMINAL_STAGES}).fillna("Overig")
+    
+    # Bepaal of een deal actief is op basis van de ID
     df['Is_Actief'] = df['stage_id_str'].isin(ACTIVE_STAGES.keys())
+    
+    # Mappen van fases
+    all_maps = {**ACTIVE_STAGES, **TERMINAL_STAGES}
+    df['Fase'] = df['stage_id_str'].map(all_maps)
+    
+    # Logica voor 'Overig': Als niet gemapped en niet actief -> Verloren
+    df.loc[df['Fase'].isna() & ~df['Is_Actief'], 'Fase'] = "Geen interesse / Verloren"
+    df['Fase'] = df['Fase'].fillna("Overig")
     
     nu = pd.Timestamp.now()
     df['dagen_in_fase'] = (nu - df['ts_warme_aanvraag'].fillna(df['createdate'])).dt.days
@@ -54,19 +68,15 @@ def load_data():
 def create_coach_summary_table(dataframe, num_coaches_denominator=1):
     """
     Maakt een samenvattingstabel waarbij de fasen de kolommen zijn.
-    num_coaches_denominator wordt gebruikt voor de benchmark (totaal / aantal coaches).
     """
-    # Aantallen en gemiddeldes berekenen
     counts = dataframe.groupby('Fase').size() / num_coaches_denominator
     days = dataframe.groupby('Fase')['dagen_in_fase'].mean()
     
-    # DataFrame bouwen en reindexeren op pijplijn volgorde
     summary = pd.DataFrame({
         'Aantal deals': counts,
         'Gem. dagen stilstand': days
     }).reindex(PIPELINE_ORDER)
     
-    # Transponeren: Fasen worden kolommen, Metrics worden rijen
     summary_t = summary.T
     return summary_t
 
@@ -75,9 +85,11 @@ df = load_data()
 if df is not None:
     st.title("🏆 Coach Benchmark Dashboard")
     
-    # --- SIDEBAR (ONGEWIJZIGD) ---
+    # --- SIDEBAR ---
     st.sidebar.header("Instellingen")
-    dagen_terug = st.sidebar.slider("Instroom periode (dagen terug):", 7, 365, 90)
+    
+    # Slider voor instroom (per dag, vanaf 1)
+    dagen_terug = st.sidebar.slider("Instroom periode (dagen terug):", min_value=1, max_value=365, value=90, step=1)
     grens_datum = pd.Timestamp.now() - timedelta(days=dagen_terug)
     
     all_coaches = sorted(df['coach_naam'].unique().tolist())
@@ -97,19 +109,26 @@ if df is not None:
     st.subheader("🌐 Overall Pijplijn Status (Alle Deals)")
     overall_counts = df_display_all['Fase'].value_counts().reindex(PIPELINE_ORDER).fillna(0)
     
+    # Bereken percentages voor de tekstlabels
+    total_deals_in_view = overall_counts.sum()
+    percentages = [(count / total_deals_in_view * 100) if total_deals_in_view > 0 else 0 for count in overall_counts.values]
+    text_labels = [f"{int(count)} ({p:.1f}%)" for count, p in zip(overall_counts.values, percentages)]
+
     fig_overall = px.bar(
         x=overall_counts.index, 
         y=overall_counts.values, 
-        labels={'x': 'Fase', 'y': 'Totaal aantal deals'},
-        title="Totaal aantal deals momenteel in elke fase (Overall)",
+        text=text_labels,
+        labels={'x': 'Fase', 'y': 'Aantal deals'},
+        title="Verdeling van alle deals over de fasen (Aantal + Percentage)",
         color=overall_counts.values,
         color_continuous_scale='Blues'
     )
+    fig_overall.update_traces(textposition='outside')
     st.plotly_chart(fig_overall, use_container_width=True)
 
     st.divider()
 
-    # --- VISUALS (GRAFIEKEN BEHOUDEN) ---
+    # --- VISUALS ---
     c1, c2 = st.columns(2)
     num_total_coaches = df_period_all['coach_naam'].nunique()
     if num_total_coaches == 0: num_total_coaches = 1
@@ -140,35 +159,41 @@ if df is not None:
         plot_days = pd.concat([plot_days, bench_days])
         
         fig_speed = px.bar(plot_days, x="Fase", y="Waarde", color="coach_naam", barmode="group")
-        fig_speed.add_hline(y=14, line_dash="dash", line_color="red", annotation_text="Stagnatiegrens")
+        # Standaard stagnatiegrens op 14 dagen (visueel)
+        fig_speed.add_hline(y=14, line_dash="dash", line_color="red", annotation_text="Grens (14d)")
         st.plotly_chart(fig_speed, use_container_width=True)
 
     st.divider()
 
-    # --- COACH PROFIELEN (TABELLEN PER COACH + BENCHMARK) ---
+    # --- COACH PROFIELEN ---
     st.subheader("📋 Coach Profielen: Gedetailleerde Vergelijking")
-    st.markdown("Fasen staan van links naar rechts in chronologische volgorde.")
+    
+    # Extra Overall Metrics voor conversie
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Totaal Dossiers in Selectie", len(df_selection))
+    with m2:
+        won = len(df_selection[df_selection['stage_id_str'] == "15413226"])
+        conv_rate = (won / len(df_selection) * 100) if len(df_selection) > 0 else 0
+        st.metric("Conversie (Gewonnen)", f"{won} ({conv_rate:.1f}%)")
+    with m3:
+        lost = len(df_selection[df_selection['Fase'] == "Geen interesse / Verloren"])
+        lost_rate = (lost / len(df_selection) * 100) if len(df_selection) > 0 else 0
+        st.metric("Uitval (Verloren)", f"{lost} ({lost_rate:.1f}%)")
 
-    # 1. De Benchmark Coach
     st.write("### 🏢 Gemiddelde Coach (Organisatie Benchmark)")
     bench_table = create_coach_summary_table(df_display_all, num_coaches_denominator=num_total_coaches)
     st.table(bench_table.style.format(precision=1, na_rep="-"))
     
     st.write("---")
 
-    # 2. Individuele Tabellen voor geselecteerde coaches
     for coach in sel_coaches:
         coach_df = df_display_all[df_display_all['coach_naam'] == coach]
-        
-        # We gebruiken een container om de tabel en de lijst bij elkaar te houden
         with st.container():
             st.write(f"### 👤 Coach: {coach}")
-            
-            # Samenvattingstabel (Precies dezelfde structuur als benchmark)
             coach_summary = create_coach_summary_table(coach_df)
             st.table(coach_summary.style.format(precision=1, na_rep="-"))
             
-            # De individuele dossiers (Alleen Record ID's) in een inklapbaar menu
             with st.expander(f"Bekijk individuele dossiers (Record ID's) voor {coach}"):
                 st.dataframe(
                     coach_df[['deal_id', 'Fase', 'dagen_in_fase', 'createdate']]
@@ -176,11 +201,11 @@ if df is not None:
                     use_container_width=True,
                     hide_index=True
                 )
-            st.write("<br>", unsafe_allow_html=True) # Extra witruimte tussen coaches
+            st.write("<br>", unsafe_allow_html=True)
 
-    st.info("""
-    **Uitleg Tabel:**
-    * De rijen tonen het **Aantal deals** (werkdruk) en de **Gemiddelde dagen stilstand** (snelheid).
-    * De kolommen volgen de pijplijn: van nieuwe aanvraag (links) tot afsluiting (rechts).
-    * De **Gemiddelde Coach** is gebaseerd op de totale dataset gedeeld door het aantal actieve coaches.
+    st.info(f"""
+    **Dashboard Info:**
+    * De tabellen tonen de pijplijn van links (instroom) naar rechts (uitstroom).
+    * De fase 'Geen interesse / Verloren' bevat nu ook de dossiers die 'Nooit bereikt' zijn.
+    * 'Overig' dossiers zonder actieve status worden in de 'Alles' modus als 'Verloren' geteld.
     """)
