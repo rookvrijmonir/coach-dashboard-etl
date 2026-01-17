@@ -1,35 +1,37 @@
 import os
 import sys
+import time
 import pandas as pd
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from hubspot import HubSpot
 from hubspot.crm.deals import PublicObjectSearchRequest, ApiException
-from hubspot.crm.associations import BatchInputPublicObjectId
-from hubspot.crm.contacts import BatchReadInputSimplePublicObjectId
 
 # --- CONFIGURATIE ---
+# We laden de .env vanuit de root map
 dotenv_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
 load_dotenv(dotenv_path)
 
+# DE VOLLEDIGE LIJST MET PROPERTIES
 DEAL_PROPS = [
     "dealname", "dealstage", "pipeline", "createdate", "hubspot_owner_id",
-    "verzekeraar", "broncoach_tekst", "hoeveelheid_begeleiding",
-    "datum_afgesloten", "hs_v2_date_entered_15413226", 
-    "ts_warme_aanvraag", "ts_info_aangevraagd", "ts_in_begeleiding",
-    # We halen ook de interne tijdstempels op die we in de CSV zagen
-    "hs_v2_date_entered_114855767", # Warme aanvraag
-    "hs_v2_date_entered_15413223"   # In begeleiding
+    "verzekeraar", "hoeveelheid_begeleiding",
+    "vgz_voldoende_begeleiding",
+    "dsw_1e_sessie_is_geweest",
+    "datum_ig",
+    "hs_v2_date_entered_114855767", 
+    "hs_v2_date_entered_15413223", 
+    "hs_v2_date_entered_15413226"  
 ]
 
 def get_client():
     token = os.getenv("HUBSPOT_ACCESS_TOKEN")
-    if not token: print("FOUT: Geen token!"); sys.exit(1)
+    if not token or "plak_hier" in token:
+        print("FOUT: Check je .env bestand!")
+        sys.exit(1)
     return HubSpot(access_token=token)
 
 def get_owner_map(client):
-    """Haalt alle HubSpot Owners op om ID's naar Namen te vertalen."""
-    print("👤 Owners ophalen uit HubSpot...")
     owner_map = {}
     try:
         owners = client.crm.owners.get_all()
@@ -44,26 +46,19 @@ def run_pipeline():
     owner_map = get_owner_map(client)
     
     print("\n" + "="*50)
-    user_input = input("🔢 Hoeveel deals ophalen? (Leeg = ALLES): ").strip()
-    max_limit = int(user_input) if user_input.isdigit() else None
-    print("="*50 + "\n")
+    print("🚀 HubSpot Data Extractie (Met Rate-Limit Recovery)")
+    print("="*50)
 
-    # Start vanaf maart 2025 (zoals in je eerdere vraag)
     current_start = datetime(2025, 3, 1)
     end_goal = datetime.now()
-    
     all_rows = []
-    total_count = 0
     
     while current_start < end_goal:
-        if max_limit and total_count >= max_limit: break
         current_end = current_start + timedelta(days=14)
         print(f"📅 Periode: {current_start.date()} tot {current_end.date()}...")
         
         after = 0
         while True:
-            if max_limit and total_count >= max_limit: break
-            
             search_request = PublicObjectSearchRequest(
                 filter_groups=[{
                     "filters": [
@@ -74,33 +69,55 @@ def run_pipeline():
                 properties=DEAL_PROPS, limit=100, after=after
             )
             
-            try:
-                resp = client.crm.deals.search_api.do_search(public_object_search_request=search_request)
-                if not resp.results: break
-                
-                for d in resp.results:
-                    p = d.properties
-                    owner_id = str(p.get("hubspot_owner_id", ""))
+            # --- RETRY LOGICA VOOR RATE LIMITS (429) ---
+            success = False
+            retries = 0
+            max_retries = 5
+            
+            while not success and retries < max_retries:
+                try:
+                    resp = client.crm.deals.search_api.do_search(public_object_search_request=search_request)
                     
-                    all_rows.append({
-                        "deal_id": d.id,
-                        "dealname": p.get("dealname"),
-                        "createdate": p.get("createdate"),
-                        "dealstage": p.get("dealstage"),
-                        "verzekeraar": p.get("verzekeraar"),
-                        "begeleiding": p.get("hoeveelheid_begeleiding"),
-                        # Gebruik de Owner Name als Coach, fallback op broncoach_tekst
-                        "coach_naam": owner_map.get(owner_id, p.get("broncoach_tekst", "Onbekend")),
-                        "ts_warme_aanvraag": p.get("hs_v2_date_entered_114855767") or p.get("createdate"),
-                        "ts_in_begeleiding": p.get("hs_v2_date_entered_15413223"),
-                        "datum_afgesloten": p.get("hs_v2_date_entered_15413226")
-                    })
-                
-                total_count += len(resp.results)
-                if not resp.paging or not resp.paging.next: break
-                after = resp.paging.next.after
-            except Exception as e:
-                print(f"❌ Fout: {e}"); break
+                    for d in resp.results:
+                        p = d.properties
+                        owner_id = str(p.get("hubspot_owner_id", ""))
+                        all_rows.append({
+                            "deal_id": d.id,
+                            "dealname": p.get("dealname"),
+                            "createdate": p.get("createdate"),
+                            "dealstage": p.get("dealstage"),
+                            "verzekeraar": p.get("verzekeraar"),
+                            "begeleiding": p.get("hoeveelheid_begeleiding"),
+                            "vgz_voldoende": p.get("vgz_voldoende_begeleiding"),
+                            "dsw_sessie": p.get("dsw_1e_sessie_is_geweest"),
+                            "datum_ig": p.get("datum_ig"),
+                            "coach_naam": owner_map.get(owner_id, "Onbekend"),
+                            "ts_warme_aanvraag": p.get("hs_v2_date_entered_114855767"),
+                            "ts_in_begeleiding": p.get("hs_v2_date_entered_15413223"),
+                            "datum_afgesloten": p.get("hs_v2_date_entered_15413226")
+                        })
+                    
+                    if not resp.paging or not resp.paging.next:
+                        after = None
+                    else:
+                        after = resp.paging.next.after
+                    
+                    success = True
+                    
+                except ApiException as e:
+                    if e.status == 429:
+                        retries += 1
+                        wait_time = 2 ** retries # Wacht 2, 4, 8, 16 seconden
+                        time.sleep(wait_time)
+                    else:
+                        print(f"❌ HubSpot API Fout: {e}")
+                        break
+                except Exception as e:
+                    print(f"❌ Onbekende fout: {e}")
+                    break
+
+            if after is None or not success:
+                break
         
         current_start = current_end
 
@@ -108,7 +125,7 @@ def run_pipeline():
         df = pd.DataFrame(all_rows)
         os.makedirs('data', exist_ok=True)
         df.to_csv('data/hubspot_export_raw.csv', index=False, sep=';')
-        print(f"✅ Export klaar: {len(df)} deals met coach-namen.")
+        print(f"✅ Export succesvol: {len(df)} deals opgeslagen in data/hubspot_export_raw.csv")
 
 if __name__ == "__main__":
     run_pipeline()
