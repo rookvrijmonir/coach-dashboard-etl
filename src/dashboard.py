@@ -86,7 +86,9 @@ def load_data():
 
     # Actief/gewonnen/verloren: primair via status_bucket (ETL)
     if 'status_bucket' in df.columns:
-        df['Is_Actief'] = (df['status_bucket'].astype(str) == 'actief')
+        # FIX: Als het een TERMINAL stage is, mag hij NOOIT actief zijn, wat status_bucket ook zegt
+        is_terminal = df['stage_id_str'].isin(TERMINAL_STAGES.keys())
+        df['Is_Actief'] = (df['status_bucket'].astype(str) == 'actief') & (~is_terminal)
     else:
         df['Is_Actief'] = df['stage_id_str'].isin(ACTIVE_STAGES.keys())
 
@@ -124,12 +126,6 @@ def load_data():
         verz = str(row.get('verzekeraar', '')).lower().strip()
         begeleiding = str(row.get('begeleiding', '')).strip()
 
-        # Gewonnen = mag_gedeclareerd_worden_datum / status_bucket (ETL)
-        if 'status_bucket' in df.columns:
-            is_won = (str(row.get('status_bucket', '')).strip().lower() == 'gewonnen')
-        else:
-            is_won = (str(row.get('stage_id_str')) == "15413226")
-
         dt_in_begeleiding = row.get('ts_in_begeleiding', pd.NaT)
         if pd.isnull(dt_in_begeleiding) and str(row.get('stage_id_str')) == "15413223":
             dt_in_begeleiding = row.get('date_entered_stage', pd.NaT)
@@ -161,27 +157,19 @@ def load_data():
 
         if pd.isnull(dec_date):
             return pd.NaT, "Niet declarabel"
+            
 
-        is_dropout = False
+        # --- DROP-OUT / VOLLEDIG BEPALING OP BASIS VAN HOEVEELHEID_BEGELEIDING ---
+        DROP_OUT_VALUES = [
+            "alleen",
+            "minder dan de helft"
+        ]
 
-        if any(v in verz for v in VGZ_GROUP):
-            is_dropout = (begeleiding == "Intake + < helft")
+        is_dropout = any(v in begeleiding.lower() for v in DROP_OUT_VALUES)
 
-        if (("cz" in verz) or ("menzis" in verz)) and (begeleiding == "Alleen intake"):
-            is_afgesloten = False
-            if 'dealstage_label' in df.columns and str(row.get('dealstage_label', '')).strip().lower() == 'afgesloten':
-                is_afgesloten = True
-            if str(row.get('stage_id_str')) == "15413226":
-                is_afgesloten = True
+        return dec_date, "Dropout" if is_dropout else "Volledig"
 
-            dt_ig = row.get('datum_ig', pd.NaT)
-            if is_afgesloten and pd.notnull(dt_ig) and dt_ig > pd.Timestamp('2024-01-01'):
-                is_dropout = True
 
-        if is_won:
-            return dec_date, "Dropout" if is_dropout else "Volledig"
-
-        return dec_date, "Declarabel (In proces)"
 
     df[['datum_declarabel', 'Declaratie_Type']] = df.apply(lambda r: pd.Series(determine_declarable_status(r)), axis=1)
 
@@ -190,18 +178,16 @@ def load_data():
     else:
         df['dagen_tot_geld'] = (df['datum_declarabel'] - df['createdate']).dt.days
 
-    if 'status_bucket' in df.columns:
-        df['Conv_Gewonnen'] = (df['status_bucket'].astype(str) == "gewonnen")
-        df['Conv_Verloren'] = (
-            (df['status_bucket'].astype(str) == "verloren") |
-            ((df['status_bucket'].astype(str) == "actief") & (df['stage_id_str'] == "15415583") & (df['dagen_in_fase'] > 30))
-        )
-    else:
-        df['Conv_Gewonnen'] = (df['stage_id_str'] == "15413226")
-        df['Conv_Verloren'] = (
-            (df['Fase'] == "Geen interesse / Verloren") |
-            ((df['stage_id_str'] == "15415583") & (df['dagen_in_fase'] > 30))
-        )
+    if 'status_bucket' in df.columns and 'Declaratie_Type' in df.columns:
+
+        # Verloren = HubSpot-verloren (blijft ongewijzigd)
+        df['Conv_Verloren'] = (df['status_bucket'].astype(str) == "verloren")
+
+        # Gewonnen = beleidsmatig declarabel
+        df['Conv_Gewonnen'] = df['Declaratie_Type'].isin([
+            "Dropout",
+            "Volledig"
+        ])
 
     return df
 
@@ -279,25 +265,169 @@ if df is not None:
 
         st.divider()
 
-        # --- 2. EFFICIENCY ---
-        st.subheader("⏱️ Efficiency: Doorlooptijd tot Declaratie")
-        eff_df = df_period[df_period['dagen_tot_geld'].notna()]
-        if not eff_df.empty:
-            target_eff = eff_df[~eff_df['Is_Actief']] if view_mode == "Alles (Historie: Won/Lost)" else eff_df[eff_df['Is_Actief']]
-            if not target_eff.empty:
-                avg_eff = target_eff.groupby(['coach_naam', 'Declaratie_Type'])['dagen_tot_geld'].mean().reset_index()
-                for dtype in target_eff['Declaratie_Type'].unique():
-                    b_val = target_eff[target_eff['Declaratie_Type'] == dtype]['dagen_tot_geld'].mean()
-                    avg_eff.loc[len(avg_eff)] = ['Gemiddelde (Benchmark)', dtype, b_val]
+        # --- 2. OPBRENGSTVERDELING (Drop-out vs Volledig) ---
+        st.subheader("💰 Opbrengstverdeling Declarabel")
 
-                plot_eff = avg_eff[avg_eff['coach_naam'].isin(sel_coaches + ['Gemiddelde (Benchmark)'])]
-                fig_eff = px.bar(plot_eff, x='coach_naam', y='dagen_tot_geld', color='Declaratie_Type',
-                                 barmode='group', text=plot_eff['dagen_tot_geld'].round(1),
-                                 color_discrete_map={'Volledig': '#2c3e50', 'Dropout': '#e67e22', 'Declarabel (In proces)': '#3498db'})
-                fig_eff.update_traces(textposition='outside')
-                st.plotly_chart(fig_eff, use_container_width=True)
+        TARIEVEN = {
+            "Volledig": 205,
+            "Dropout": 102.5
+        }
+
+        rev_df = df[
+            (df['createdate'] >= grens_datum) &
+            (df['Declaratie_Type'].isin(["Volledig", "Dropout"]))
+        ].copy()
+
+        # aantallen per coach + type
+        grp = (
+            rev_df
+            .groupby(['coach_naam', 'Declaratie_Type'])
+            .size()
+            .reset_index(name='Aantal')
+        )
+
+        # bedrag berekenen
+        grp['Tarief'] = grp['Declaratie_Type'].map(TARIEVEN)
+        grp['Bedrag'] = grp['Aantal'] * grp['Tarief']
+
+        # benchmark = gemiddelde per coach
+        bench = (
+            grp
+            .groupby(['coach_naam', 'Declaratie_Type'])[['Aantal', 'Bedrag']]
+            .sum()
+            .reset_index()
+            .groupby('Declaratie_Type')[['Aantal', 'Bedrag']]
+            .mean()
+            .reset_index()
+        )
+
+        # afronden: aantallen 1 dec, bedragen hele euro's
+        bench['Aantal'] = bench['Aantal'].round(1)
+        bench['Bedrag'] = bench['Bedrag'].round(0)
+
+
+        bench['coach_naam'] = 'Gemiddelde (Benchmark)'
+
+
+        plot_df = pd.concat([grp, bench], ignore_index=True)
+
+        # percentages per coach
+        plot_df['Totaal'] = plot_df.groupby('coach_naam')['Aantal'].transform('sum')
+        plot_df['Percentage'] = (plot_df['Aantal'] / plot_df['Totaal'] * 100).round(1)
+
+        plot_df = plot_df[
+            plot_df['coach_naam'].isin(sel_coaches + ['Gemiddelde (Benchmark)'])
+        ]
+
+        plot_df['Label'] = (
+            plot_df['Aantal'].apply(fmt_1dec_drop0)
+            + " | "
+            + plot_df['Percentage'].apply(fmt_1dec_drop0) + "%"
+            + "\n€" + plot_df['Bedrag'].round(0).astype(int).astype(str)
+        )
+
+
+        fig = px.bar(
+            plot_df,
+            x='coach_naam',
+            y='Aantal',
+            color='Declaratie_Type',
+            barmode='group',
+            text='Label',
+            color_discrete_map={
+                'Volledig': '#2c3e50',
+                'Dropout': '#e67e22'
+            }
+        )
+
+        fig.update_traces(textposition='outside')
+
+        # --- Y-as netjes formatteren (1 decimaal, .0 weg) ---
+        all_y = []
+        for t in fig.data:
+            all_y.extend(t.y)
+
+        ticks = sorted(set(all_y))
+
+        fig.update_yaxes(
+            tickvals=ticks,
+            ticktext=[fmt_1dec_drop0(v) for v in ticks]
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+        st.divider()
+
+
+                # --- 2B. GEMIDDELDE DOORLOOPTIJD TOT DECLARATIE ---
+        st.subheader("⏱️ Gemiddelde doorlooptijd tot Drop-out / Volledig")
+
+        time_df = df[
+            (df['createdate'] >= grens_datum) &
+            (df['Declaratie_Type'].isin(['Dropout', 'Volledig'])) &
+            (df['dagen_tot_geld'].notna())
+        ].copy()
+
+        if not time_df.empty:
+            # gemiddelde per coach + type
+            avg_time = (
+                time_df
+                .groupby(['coach_naam', 'Declaratie_Type'])['dagen_tot_geld']
+                .mean()
+                .reset_index()
+                .round(1)
+            )
+
+            # benchmark = gemiddelde over alle coaches
+            bench_time = (
+                avg_time
+                .groupby('Declaratie_Type')['dagen_tot_geld']
+                .mean()
+                .reset_index()
+                .round(1)
+            )
+            bench_time['coach_naam'] = 'Gemiddelde (Benchmark)'
+
+            plot_time = pd.concat([avg_time, bench_time], ignore_index=True)
+
+            plot_time = plot_time[
+                plot_time['coach_naam'].isin(sel_coaches + ['Gemiddelde (Benchmark)'])
+            ]
+
+            plot_time['Label'] = plot_time['dagen_tot_geld'].apply(fmt_1dec_drop0)
+
+            fig_time = px.bar(
+                plot_time,
+                x='coach_naam',
+                y='dagen_tot_geld',
+                color='Declaratie_Type',
+                barmode='group',
+                text='Label',
+                color_discrete_map={
+                    'Volledig': '#2c3e50',
+                    'Dropout': '#e67e22'
+                }
+            )
+
+            fig_time.update_traces(textposition='outside')
+
+            # Y-as netjes formatteren (1 decimaal, .0 weg)
+            all_y = []
+            for t in fig_time.data:
+                all_y.extend(t.y)
+
+            ticks = sorted(set(all_y))
+
+            fig_time.update_yaxes(
+                tickvals=ticks,
+                ticktext=[fmt_1dec_drop0(v) for v in ticks],
+                title="Gemiddelde dagen"
+            )
+
+            st.plotly_chart(fig_time, use_container_width=True)
 
         st.divider()
+
+
 
         # --- 3. WERKDRUK & STILSTAND ---
         st.subheader("📊 Werkdruk & Procesgezondheid")

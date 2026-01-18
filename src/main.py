@@ -39,7 +39,7 @@ NABELLER_INFLOW_STAGE_IDS = {"116831596", "81686449"}
 
 # Contacteigenschappen (van het deelnemer-record)
 # GEBOORTEDATUM_BEKEND toegevoegd als container voorwaarde
-CONTACT_PROPS = ["aangebracht_door", "zip", "geslacht", "geboortejaar", "geboortedatum_bekend"]
+CONTACT_PROPS = ["aangebracht_door", "zip", "geslacht"]
 
 
 def get_token() -> str:
@@ -233,8 +233,8 @@ def run_pipeline():
         "dealname", "dealstage", "hubspot_owner_id", "createdate", "closedate", "pipeline",
         "verzekeraar", "hoeveelheid_begeleiding", "record_id_contactpersoon",
         "vgz_voldoende_begeleiding", "dsw_1e_sessie_is_geweest", "datum_ig",
-        "broncoach_tekst", "mag_gedeclareerd_worden_datum",
-        "patient_id", "type_begeleiding", # NIEUW VOOR JAMES/TARIEVEN 2026
+        "broncoach_tekst", "mag_gedeclareerd_worden_datum", "geboortedatum_bekend",
+        "patient_id", "type_begeleiding", "geboortedatum_bekend", # NIEUW VOOR JAMES/TARIEVEN 2026
         *hs_v2_props,
     ]
 
@@ -349,6 +349,7 @@ def run_pipeline():
 
         final_rows.append({
             "deal_id": d.get("deal_id"),
+            "record_id_contactpersoon": c_id,
             "dealname": d.get("dealname"),
             "createdate": d.get("createdate"),
             "closedate": d.get("closedate"),
@@ -376,8 +377,7 @@ def run_pipeline():
             "postcode": cp.get("zip"),
             "aangebracht_door": cp.get("aangebracht_door"),
             "geslacht": cp.get("geslacht"),
-            "geboortejaar": cp.get("geboortejaar"),
-            "geboortedatum_bekend": cp.get("geboortedatum_bekend"), # NIEUW
+            "geboortedatum_bekend": str(d.get("geboortedatum_bekend") or ""),
         })
 
     df = pd.DataFrame(final_rows)
