@@ -263,7 +263,11 @@ def run_pipeline():
                 resp = client.crm.deals.search_api.do_search(public_object_search_request=search_request)
                 if not resp.results: break
                 for d in resp.results:
-                    all_deals.append(d.properties)
+                    all_deals.append({
+                        **d.properties,
+                        "deal_id": str(d.id)
+                    })
+
                 after = resp.paging.next.after if resp.paging and resp.paging.next else None
                 if not after: break
             except ApiException as e:
@@ -344,7 +348,7 @@ def run_pipeline():
         cp = contact_data.get(c_id, {})
 
         final_rows.append({
-            "deal_id": d.get("hs_object_id"),
+            "deal_id": d.get("deal_id"),
             "dealname": d.get("dealname"),
             "createdate": d.get("createdate"),
             "closedate": d.get("closedate"),
@@ -377,6 +381,9 @@ def run_pipeline():
         })
 
     df = pd.DataFrame(final_rows)
+    df = df[df["deal_id"].notna()]
+    df = df.drop_duplicates(subset=["deal_id"])
+
     df.to_csv(EXPORT_PATH, index=False, sep=';', encoding='utf-8')
     print(f"✅ Succes! {len(df)} dossiers opgeslagen in {EXPORT_PATH}")
 
