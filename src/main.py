@@ -1,11 +1,13 @@
 # src/main.py
 # -----------------------------------------------------------------------------
 # UNIFIED ETL ENGINE: Deals & Contacts (Batched)
-# 
+#
 # AANPASSINGEN 2026:
 # - Toegevoegd: patient_id (James koppeling)
 # - Toegevoegd: type_begeleiding (Tariefbepaling)
 # - Toegevoegd: geboortedatum_bekend (Container voorwaarde)
+# - Toegevoegd: hoeveelheid_begeleiding property history voor declarabel_op
+# - Verwijderd: mag_gedeclareerd_worden, mag_gedeclareerd_worden_datum
 # -----------------------------------------------------------------------------
 
 import os
@@ -37,8 +39,11 @@ NABELLER_TERMINAL_LOSS_STAGE_IDS = {"81675521", "81675523", "96512011"}
 # Nabeller instroom stages (voor days_to_declarable baseline als deal in Nabeller zit)
 NABELLER_INFLOW_STAGE_IDS = {"116831596", "81686449"}
 
+# Verzekeraar groepen
+VGZ_GROEP = ['vgz', 'unive', 'umc', 'izz', 'iza', 'zekur', 'bewuzt']
+DSW_GROEP = ['dsw', 'stad holland', 'intwente', 'rma', 'rmo', 'svzk']
+
 # Contacteigenschappen (van het deelnemer-record)
-# GEBOORTEDATUM_BEKEND toegevoegd als container voorwaarde
 CONTACT_PROPS = ["aangebracht_door", "zip", "geslacht"]
 
 
@@ -165,11 +170,8 @@ def compute_status_bucket(
     dealstage: str,
     dealstage_label: str,
     is_nabeller: bool,
-    mag_decl: str | None,
     stage_probability: dict[str, float | None],
 ) -> str:
-    if mag_decl and str(mag_decl).strip():
-        return "gewonnen"
     if (dealstage_label or "").strip().lower() == "afgesloten":
         return "verloren"
     if is_nabeller and dealstage in NABELLER_TERMINAL_LOSS_STAGE_IDS:
@@ -204,6 +206,113 @@ def compute_time_in_stage(
     return format_duration_from_seconds(seconds), date_entered, date_exited
 
 
+def check_container_valid(geboortedatum_bekend: str, patient_id: str, verzekeraar: str) -> bool:
+    """
+    Container check: alle velden moeten aanwezig zijn.
+    """
+    geb_ok = str(geboortedatum_bekend).strip().lower() == 'true'
+    patient_ok = bool(patient_id and str(patient_id).strip() and str(patient_id).strip().lower() not in ('nan', 'none', ''))
+    verz_clean = str(verzekeraar).strip().lower() if verzekeraar else ''
+    verz_ok = bool(verz_clean and verz_clean not in ('nan', 'none', '', 'onbekend'))
+    return geb_ok and patient_ok and verz_ok
+
+
+def compute_declarabel_status(
+    verzekeraar: str,
+    hoeveelheid_begeleiding: str,
+    vgz_voldoende: str,
+    dsw_sessie: str,
+    container_valid: bool,
+) -> tuple[bool, str]:
+    """
+    Bepaal declarabel_status en declarabel_type op basis van verzekeraar en begeleiding.
+    Returns (declarabel_status, declarabel_type)
+    """
+    if not container_valid:
+        return False, ""
+
+    verz = str(verzekeraar).strip().lower() if verzekeraar else ''
+    begeleiding = str(hoeveelheid_begeleiding).strip().lower() if hoeveelheid_begeleiding else ''
+    vgz_ok = str(vgz_voldoende).strip().lower() == 'true'
+    dsw_ok = str(dsw_sessie).strip().lower() == 'true'
+
+    if not begeleiding or begeleiding in ('nan', 'none', ''):
+        return False, ""
+
+    # VGZ Groep
+    if verz in VGZ_GROEP:
+        if not vgz_ok:
+            return False, ""
+        if begeleiding == 'intake en minder dan de helft van de sessies':
+            return True, "DROPOUT"
+        if begeleiding in ('intake en meer dan de helft van de sessies', 'volledige begeleiding gevolgd'):
+            return True, "VOLLEDIG"
+        return False, ""
+
+    # DSW Groep
+    if verz in DSW_GROEP:
+        if not dsw_ok:
+            return False, ""
+        if begeleiding in (
+            'intake en eerste themasessie',
+            'intake en minder dan de helft van de sessies',
+            'intake en meer dan de helft van de sessies',
+            'volledige begeleiding gevolgd'
+        ):
+            return True, "VOLLEDIG"
+        return False, ""
+
+    # Overig (alle andere bekende verzekeraars)
+    if begeleiding == 'alleen de intake':
+        return True, "DROPOUT"
+    if begeleiding in (
+        'intake en eerste themasessie',
+        'intake en minder dan de helft van de sessies',
+        'intake en meer dan de helft van de sessies',
+        'volledige begeleiding gevolgd'
+    ):
+        return True, "VOLLEDIG"
+
+    return False, ""
+
+
+def fetch_hoeveelheid_begeleiding_set_op(deal_id: str) -> datetime | None:
+    """
+    Haal de EERSTE timestamp op waarop hoeveelheid_begeleiding een waarde kreeg.
+    Gebruikt individuele GET call met propertiesWithHistory.
+    """
+    try:
+        data = hs_get_json(
+            f"/crm/v3/objects/deals/{deal_id}",
+            params={"propertiesWithHistory": "hoeveelheid_begeleiding"}
+        )
+    except Exception:
+        return None
+
+    props_with_history = data.get("propertiesWithHistory", {})
+    hoeveelheid_history = props_with_history.get("hoeveelheid_begeleiding", [])
+
+    if not hoeveelheid_history:
+        return None
+
+    # Filter entries met een daadwerkelijke waarde
+    valid_entries = []
+    for entry in hoeveelheid_history:
+        val = entry.get("value")
+        if val and str(val).strip() and str(val).strip().lower() not in ('nan', 'none', ''):
+            ts = entry.get("timestamp")
+            if ts:
+                dt = parse_to_utc_datetime(ts)
+                if dt:
+                    valid_entries.append(dt)
+
+    if not valid_entries:
+        return None
+
+    # Return de vroegste (eerste) timestamp
+    return min(valid_entries)
+
+
 def run_pipeline():
     client = get_client()
 
@@ -228,13 +337,13 @@ def run_pipeline():
             f"hs_v2_latest_time_in_{sid}",
         ])
 
-    # DEAL properties uitgebreid met patient_id en type_begeleiding
+    # DEAL properties
     DEAL_PROPS = [
         "dealname", "dealstage", "hubspot_owner_id", "createdate", "closedate", "pipeline",
         "verzekeraar", "hoeveelheid_begeleiding", "record_id_contactpersoon",
         "vgz_voldoende_begeleiding", "dsw_1e_sessie_is_geweest", "datum_ig",
-        "broncoach_tekst", "mag_gedeclareerd_worden_datum", "geboortedatum_bekend",
-        "patient_id", "type_begeleiding", "geboortedatum_bekend", # NIEUW VOOR JAMES/TARIEVEN 2026
+        "broncoach_tekst", "geboortedatum_bekend",
+        "patient_id", "type_begeleiding",
         *hs_v2_props,
     ]
 
@@ -301,7 +410,12 @@ def run_pipeline():
     final_rows = []
     now_utc = datetime.now(tz=timezone.utc)
 
-    for d in all_deals:
+    # Verwerk alle deals
+    total_deals = len(all_deals)
+    deals_with_history_call = 0
+
+    for idx, d in enumerate(all_deals):
+        deal_id = d.get("deal_id")
         dealstage = str(d.get("dealstage") or "")
         pipeline_id = str(d.get("pipeline") or "")
         dealstage_label = stage_label.get(dealstage, "")
@@ -313,13 +427,11 @@ def run_pipeline():
             _, pipeline_label = stage_to_pipeline[dealstage]
 
         is_nabeller = bool(nabeller_pipeline_id and pipeline_id == str(nabeller_pipeline_id))
-        mag_decl_raw = d.get("mag_gedeclareerd_worden_datum")
-        datum_declarabel = to_date_str(mag_decl_raw)
 
         coach_naam = owner_map.get(str(d.get("hubspot_owner_id", "")), "Onbekend")
         coach_attribuut = compute_coach_attribuut(is_nabeller, d.get("broncoach_tekst"), coach_naam)
 
-        status_bucket = compute_status_bucket(dealstage, dealstage_label, is_nabeller, mag_decl_raw, stage_probability)
+        status_bucket = compute_status_bucket(dealstage, dealstage_label, is_nabeller, stage_probability)
 
         latest_time_val = d.get(f"hs_v2_latest_time_in_{dealstage}") if dealstage else ""
         entered_val = d.get(f"hs_v2_date_entered_{dealstage}") if dealstage else ""
@@ -327,28 +439,59 @@ def run_pipeline():
 
         time_in_stage, date_entered_stage, date_exited_stage = compute_time_in_stage(entered_val, exited_val, latest_time_val, now_utc)
 
+        # Container check
+        geboortedatum_bekend = str(d.get("geboortedatum_bekend") or "")
+        patient_id = str(d.get("patient_id") or "")
+        verzekeraar = str(d.get("verzekeraar") or "")
+        container_valid = check_container_valid(geboortedatum_bekend, patient_id, verzekeraar)
+
+        # Declarabel logica
+        hoeveelheid_begeleiding = str(d.get("hoeveelheid_begeleiding") or "")
+        vgz_voldoende = str(d.get("vgz_voldoende_begeleiding") or "")
+        dsw_sessie = str(d.get("dsw_1e_sessie_is_geweest") or "")
+
+        declarabel_status, declarabel_type = compute_declarabel_status(
+            verzekeraar, hoeveelheid_begeleiding, vgz_voldoende, dsw_sessie, container_valid
+        )
+
+        # hoeveelheid_begeleiding_set_op: alleen ophalen als er een waarde is
+        hoeveelheid_begeleiding_set_op = None
+        hoeveelheid_begeleiding_clean = hoeveelheid_begeleiding.strip().lower() if hoeveelheid_begeleiding else ''
+
+        if hoeveelheid_begeleiding_clean and hoeveelheid_begeleiding_clean not in ('nan', 'none', ''):
+            # Individuele GET call voor property history
+            hoeveelheid_begeleiding_set_op = fetch_hoeveelheid_begeleiding_set_op(deal_id)
+            deals_with_history_call += 1
+            if deals_with_history_call % 100 == 0:
+                print(f"📜 Property history opgehaald voor {deals_with_history_call} deals...")
+                time.sleep(0.1)  # Rate limit
+
+        hoeveelheid_begeleiding_set_op_str = hoeveelheid_begeleiding_set_op.strftime("%Y-%m-%d %H:%M:%S") if hoeveelheid_begeleiding_set_op else ""
+
+        declarabel_op = ""
+        if declarabel_status and hoeveelheid_begeleiding_set_op:
+            declarabel_op = hoeveelheid_begeleiding_set_op.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Days to declarable
         days_to_declarable = ""
-        if datum_declarabel:
-            try:
-                decl_dt = datetime.fromisoformat(datum_declarabel + "T00:00:00+00:00")
-                baseline_dt = None
-                if is_nabeller:
-                    inflow_dts = []
-                    for sid in NABELLER_INFLOW_STAGE_IDS:
-                        dtv = parse_to_utc_datetime(d.get(f"hs_v2_date_entered_{sid}"))
-                        if dtv: inflow_dts.append(dtv)
-                    if inflow_dts: baseline_dt = min(inflow_dts)
-                if not baseline_dt:
-                    baseline_dt = parse_to_utc_datetime(d.get("createdate"))
-                if baseline_dt:
-                    days_to_declarable = round((decl_dt - baseline_dt).total_seconds() / 86400.0, 1)
-            except Exception: pass
+        if declarabel_status and hoeveelheid_begeleiding_set_op:
+            baseline_dt = None
+            if is_nabeller:
+                inflow_dts = []
+                for sid in NABELLER_INFLOW_STAGE_IDS:
+                    dtv = parse_to_utc_datetime(d.get(f"hs_v2_date_entered_{sid}"))
+                    if dtv: inflow_dts.append(dtv)
+                if inflow_dts: baseline_dt = min(inflow_dts)
+            if not baseline_dt:
+                baseline_dt = parse_to_utc_datetime(d.get("createdate"))
+            if baseline_dt:
+                days_to_declarable = round((hoeveelheid_begeleiding_set_op - baseline_dt).total_seconds() / 86400.0, 1)
 
         c_id = str(d.get("record_id_contactpersoon", ""))
         cp = contact_data.get(c_id, {})
 
         final_rows.append({
-            "deal_id": d.get("deal_id"),
+            "deal_id": deal_id,
             "record_id_contactpersoon": c_id,
             "dealname": d.get("dealname"),
             "createdate": d.get("createdate"),
@@ -361,24 +504,28 @@ def run_pipeline():
             "coach_attribuut": coach_attribuut,
             "broncoach_tekst": d.get("broncoach_tekst"),
             "status_bucket": status_bucket,
-            "mag_gedeclareerd_worden_datum": mag_decl_raw,
-            "datum_declarabel": datum_declarabel,
-            "days_to_declarable": days_to_declarable,
             "time_in_stage": time_in_stage,
             "date_entered_stage": date_entered_stage,
             "date_exited_stage": date_exited_stage,
-            "verzekeraar": d.get("verzekeraar"),
-            "begeleiding": d.get("hoeveelheid_begeleiding"),
-            "vgz_voldoende": d.get("vgz_voldoende_begeleiding"),
-            "dsw_sessie": d.get("dsw_1e_sessie_is_geweest"),
+            "verzekeraar": verzekeraar,
+            "begeleiding": hoeveelheid_begeleiding,
+            "vgz_voldoende": vgz_voldoende,
+            "dsw_sessie": dsw_sessie,
             "datum_ig": d.get("datum_ig"),
-            "patient_id": d.get("patient_id"), # NIEUW
-            "type_begeleiding": d.get("type_begeleiding"), # NIEUW
+            "patient_id": patient_id,
+            "type_begeleiding": d.get("type_begeleiding"),
             "postcode": cp.get("zip"),
             "aangebracht_door": cp.get("aangebracht_door"),
             "geslacht": cp.get("geslacht"),
-            "geboortedatum_bekend": str(d.get("geboortedatum_bekend") or ""),
+            "geboortedatum_bekend": geboortedatum_bekend,
+            "hoeveelheid_begeleiding_set_op": hoeveelheid_begeleiding_set_op_str,
+            "declarabel_status": declarabel_status,
+            "declarabel_type": declarabel_type,
+            "declarabel_op": declarabel_op,
+            "days_to_declarable": days_to_declarable,
         })
+
+    print(f"📜 Property history opgehaald voor {deals_with_history_call} deals totaal")
 
     df = pd.DataFrame(final_rows)
     df = df[df["deal_id"].notna()]
