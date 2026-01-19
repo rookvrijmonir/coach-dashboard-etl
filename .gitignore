@@ -11,6 +11,7 @@ secrets.json
 data/*
 !data/.gitkeep
 *.csv
+!data/hubspot_met_factuurdatum.csv
 *.xlsx
 
 # Mac/Windows systeem bestanden
