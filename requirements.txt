@@ -16,5 +16,8 @@ python-dotenv>=1.0.0
 streamlit>=1.22.0
 plotly>=5.14.0
 
+# Statistiek
+scipy>=1.10.0
+
 # HTTP client voor HubSpot calls (als je niet hubspot-api-client gebruikt)
 requests>=2.31.0
